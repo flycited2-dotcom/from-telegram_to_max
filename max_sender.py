@@ -98,10 +98,20 @@ async def _type_text(page, text: str) -> bool:
         )
 
         if confirmed:
-            log.info("Текст подтверждён в composer")
+            log.info("Текст подтверждён в composer (точное совпадение)")
             return True
 
-        log.error("Текст не подтвердился в composer")
+        # Точное includes() ломается на эмодзи / variation selectors из-за
+        # Unicode-нормализации между keyboard.type и innerText. Если в composer
+        # есть хоть какой-то текст — считаем ввод состоявшимся: дальнейший
+        # _click_send всё равно проверит, что composer очистился после отправки.
+        if await _composer_has_text(page):
+            log.warning(
+                "Точное совпадение не нашли, но в composer есть текст — продолжаем"
+            )
+            return True
+
+        log.error("Текст не введён в composer")
         await _save_debug(page, "text_not_confirmed")
         return False
 
