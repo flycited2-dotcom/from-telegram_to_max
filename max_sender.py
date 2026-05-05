@@ -66,8 +66,17 @@ async def _type_text(page, text: str) -> bool:
         await page.keyboard.press("Control+A")
         await page.wait_for_timeout(150)
 
-        await page.keyboard.type(text, delay=10)
+        # Enter в композере MAX = отправить, поэтому многострочный текст
+        # вводим строками с Shift+Enter (soft break) между ними.
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if i > 0:
+                await page.keyboard.press("Shift+Enter")
+            if line:
+                await page.keyboard.type(line, delay=10)
         await page.wait_for_timeout(800)
+
+        first_line = next((ln for ln in lines if ln.strip()), "")[:80]
 
         confirmed = await page.evaluate(
             """
@@ -85,7 +94,7 @@ async def _type_text(page, text: str) -> bool:
                 return value.includes(expected.trim());
             }
             """,
-            text[:80],
+            first_line,
         )
 
         if confirmed:
