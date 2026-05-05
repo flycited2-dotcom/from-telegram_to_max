@@ -17,7 +17,9 @@ from max_sender import send_to_max
 load_dotenv(Path(__file__).parent / ".env")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = int(os.environ["CHANNEL_ID"])
+CHANNEL_IDS = frozenset(
+    int(x) for x in os.environ["CHANNEL_IDS"].split(",") if x.strip()
+)
 LOG_FILE = str(Path(__file__).parent / "bridge.log")
 
 MAX_SEND_TIMEOUT = 240
@@ -77,8 +79,8 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = msg.chat.id
 
-    if chat_id != CHANNEL_ID:
-        log.warning("Пост из чужого чата %s, нужен %s, пропускаем", chat_id, CHANNEL_ID)
+    if chat_id not in CHANNEL_IDS:
+        log.warning("Пост из чужого чата %s, разрешены %s, пропускаем", chat_id, sorted(CHANNEL_IDS))
         return
 
     text = msg.text or msg.caption or ""
@@ -189,7 +191,7 @@ async def post_init(app: Application):
 
 def main():
     log.info("=== Запуск моста Telegram → Max с очередью ===")
-    log.info("Канал: %s", CHANNEL_ID)
+    log.info("Каналы: %s", sorted(CHANNEL_IDS))
 
     app = (
         Application

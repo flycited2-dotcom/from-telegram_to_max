@@ -19,7 +19,7 @@
 | Имя | Что это |
 |---|---|
 | `BOT_TOKEN` | токен Telegram-бота из `@BotFather` |
-| `CHANNEL_ID` | ID канала-источника, отрицательное число с `-100` |
+| `CHANNEL_IDS` | список ID каналов-источников через запятую, каждый — отрицательное число с `-100` (можно один или несколько) |
 | `MAX_CHAT_URL` | полный URL чата MAX, напр. `https://web.max.ru/-12345` |
 
 ## Подготовка сессии MAX (нужно один раз)
@@ -52,7 +52,7 @@ python3 -m venv .venv
 .venv/bin/playwright install --with-deps chromium
 
 cp .env.example .env
-# отредактировать .env: BOT_TOKEN, CHANNEL_ID, MAX_CHAT_URL
+# отредактировать .env: BOT_TOKEN, CHANNEL_IDS, MAX_CHAT_URL
 chmod 600 .env
 
 # положить max_session.json (см. выше)
@@ -67,7 +67,7 @@ journalctl -u tg-max-bridge -f
 
 ## Поведение
 
-- Принимаются `channel_post`, `message`, `edited_*` из канала, чей ID совпадает с `CHANNEL_ID`. Остальное игнорируется.
+- Принимаются `channel_post`, `message`, `edited_*` из любого канала, чей ID есть в `CHANNEL_IDS`. Остальное игнорируется.
 - Фото скачивается во временный `/tmp/tg_photo_<job>_<file_id>.jpg` и удаляется после отправки/таймаута.
 - При сбое отправки делаются `debug/<step>.png|.html` рядом со скриптами.
 - Очередь `QUEUE_MAX_SIZE=100`, таймаут отправки `MAX_SEND_TIMEOUT=240` сек.
