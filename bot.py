@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import os
+import re
+import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -24,6 +27,8 @@ LOG_FILE = str(Path(__file__).parent / "bridge.log")
 
 MAX_SEND_TIMEOUT = 240
 QUEUE_MAX_SIZE = 100
+# Telegram Bot API лимит на скачивание файлов через get_file — 20 МБ.
+DOC_MAX_SIZE = 20 * 1024 * 1024
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +51,14 @@ class BridgeJob:
     message_id: int
     text: str
     photo_path: Optional[str]
+    document_path: Optional[str]
+    document_name: Optional[str]
     created_at: float
+
+
+def _safe_filename(raw: Optional[str], fallback: str) -> str:
+    cleaned = re.sub(r"[\\/\x00]", "_", raw or "").strip()
+    return cleaned or fallback
 
 
 def describe_update(update: Update) -> str:
@@ -85,16 +97,19 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = msg.text or msg.caption or ""
     photo_path = None
+    document_path = None
+    document_name = None
 
     job_id = str(uuid.uuid4())[:8]
 
     log.info(
-        "[%s] Новый пост из канала %s, message_id=%s, text='%s', photo=%s",
+        "[%s] Новый пост из канала %s, message_id=%s, text='%s', photo=%s, document=%s",
         job_id,
         chat_id,
         msg.message_id,
         text[:120],
-        bool(msg.photo)
+        bool(msg.photo),
+        bool(msg.document)
     )
 
     if msg.photo:
@@ -114,8 +129,45 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("[%s] Ошибка скачивания фото: %s", job_id, exc)
             photo_path = None
 
-    if not text and not photo_path:
-        log.warning("[%s] Нет текста и фото, пропускаем", job_id)
+    if msg.document:
+        doc = msg.document
+        if doc.file_size and doc.file_size > DOC_MAX_SIZE:
+            log.warning(
+                "[%s] Документ '%s' слишком большой (%s байт), Bot API лимит 20 МБ. Пропускаем документ",
+                job_id,
+                doc.file_name,
+                doc.file_size,
+            )
+        else:
+            try:
+                doc_dir = tempfile.mkdtemp(prefix=f"tg_doc_{job_id}_")
+                document_name = _safe_filename(doc.file_name, f"file_{doc.file_id}")
+                document_path = os.path.join(doc_dir, document_name)
+                file = await context.bot.get_file(doc.file_id)
+                await file.download_to_drive(document_path)
+
+                if os.path.exists(document_path):
+                    log.info(
+                        "[%s] Документ скачан: %s, размер=%s байт",
+                        job_id,
+                        document_path,
+                        os.path.getsize(document_path),
+                    )
+                else:
+                    log.error("[%s] После скачивания документа файла нет: %s", job_id, document_path)
+                    shutil.rmtree(doc_dir, ignore_errors=True)
+                    document_path = None
+                    document_name = None
+
+            except Exception as exc:
+                log.exception("[%s] Ошибка скачивания документа: %s", job_id, exc)
+                if document_path:
+                    shutil.rmtree(os.path.dirname(document_path), ignore_errors=True)
+                document_path = None
+                document_name = None
+
+    if not text and not photo_path and not document_path:
+        log.warning("[%s] Нет текста, фото и документа, пропускаем", job_id)
         return
 
     job = BridgeJob(
@@ -124,6 +176,8 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_id=msg.message_id,
         text=text,
         photo_path=photo_path,
+        document_path=document_path,
+        document_name=document_name,
         created_at=time.time()
     )
 
@@ -138,6 +192,8 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(photo_path)
             except Exception:
                 pass
+        if document_path:
+            shutil.rmtree(os.path.dirname(document_path), ignore_errors=True)
 
 
 async def max_worker():
@@ -149,16 +205,22 @@ async def max_worker():
         wait_sec = round(time.time() - job.created_at, 1)
 
         log.info(
-            "[%s] Worker взял задачу. Ждала в очереди %s сек. text=%s, photo=%s",
+            "[%s] Worker взял задачу. Ждала в очереди %s сек. text=%s, photo=%s, document=%s",
             job.job_id,
             wait_sec,
             bool(job.text),
-            bool(job.photo_path)
+            bool(job.photo_path),
+            bool(job.document_path)
         )
 
         try:
             ok = await asyncio.wait_for(
-                send_to_max(text=job.text, photo_path=job.photo_path),
+                send_to_max(
+                    text=job.text,
+                    photo_path=job.photo_path,
+                    document_path=job.document_path,
+                    document_name=job.document_name,
+                ),
                 timeout=MAX_SEND_TIMEOUT
             )
 
@@ -180,6 +242,14 @@ async def max_worker():
                     log.info("[%s] Временное фото удалено: %s", job.job_id, job.photo_path)
                 except Exception as exc:
                     log.warning("[%s] Не удалось удалить временное фото: %s", job.job_id, exc)
+
+            if job.document_path:
+                doc_dir = os.path.dirname(job.document_path)
+                try:
+                    shutil.rmtree(doc_dir, ignore_errors=True)
+                    log.info("[%s] Временный документ удалён: %s", job.job_id, job.document_path)
+                except Exception as exc:
+                    log.warning("[%s] Не удалось удалить временный документ: %s", job.job_id, exc)
 
             send_queue.task_done()
             log.info("[%s] Задача завершена. Очередь: %s", job.job_id, send_queue.qsize())

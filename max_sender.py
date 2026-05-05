@@ -348,6 +348,154 @@ async def _attach_photo(page, photo_path: str) -> bool:
         return False
 
 
+async def _wait_doc_attached(page, expected_name: str, timeout_ms: int = 30000) -> bool:
+    """Файл считаем прикреплённым, если внутри composer появилась его имя
+    (карточка с filename) или хотя бы любой attach-элемент."""
+    log.info("Ждём появления документа '%s' в composer", expected_name)
+
+    needle = expected_name.strip()
+    attempts = max(1, timeout_ms // 500)
+
+    for _ in range(attempts):
+        if needle:
+            found_by_name = await page.evaluate(
+                """
+                (name) => {
+                    const composer = document.querySelector('[data-testid="composer"]');
+                    if (!composer) return false;
+                    const text = composer.innerText || composer.textContent || '';
+                    return text.includes(name);
+                }
+                """,
+                needle,
+            )
+
+            if found_by_name:
+                log.info("Документ найден в composer по имени файла")
+                return True
+
+        if await _composer_has_media(page):
+            log.info("Документ найден в composer по media-count")
+            return True
+
+        await page.wait_for_timeout(500)
+
+    log.error("Документ не появился в composer")
+    return False
+
+
+async def _attach_document(page, doc_path: str, doc_name: str) -> bool:
+    path = Path(doc_path)
+
+    if not path.exists():
+        log.error("Документ не найден: %s", doc_path)
+        return False
+
+    if path.stat().st_size <= 0:
+        log.error("Документ пустой: %s", doc_path)
+        return False
+
+    try:
+        composer = await _wait_composer(page)
+
+        log.info("Прикрепляем документ через меню Max: скрепка -> Файл")
+
+        upload_button = composer.locator('button[aria-label="Загрузить файл"]').first
+        await upload_button.wait_for(state="visible", timeout=15000)
+
+        await upload_button.click(force=True)
+        await page.wait_for_timeout(1000)
+
+        file_menu_selectors = [
+            'text="Файл"',
+            'button:has-text("Файл")',
+            '[role="button"]:has-text("Файл")',
+            'div:has-text("Файл")',
+        ]
+
+        clicked_menu = False
+
+        for selector in file_menu_selectors:
+            try:
+                item = page.locator(selector).first
+                await item.wait_for(state="visible", timeout=3000)
+
+                log.info("Найден пункт меню документа: %s", selector)
+
+                async with page.expect_file_chooser(timeout=10000) as fc_info:
+                    await item.click(force=True)
+
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(str(path))
+
+                clicked_menu = True
+                log.info("Файл передан через file chooser после пункта 'Файл'")
+                break
+
+            except Exception as exc:
+                log.warning("Пункт меню/chooser не сработал %s: %s", selector, exc)
+
+        if not clicked_menu:
+            log.warning("File chooser через пункт меню не пойман, пробуем input[type=file] после открытия меню")
+
+            try:
+                file_inputs = page.locator('input[type="file"]')
+                count = await file_inputs.count()
+                log.info("input[type=file] после меню: %s", count)
+
+                for i in range(count):
+                    try:
+                        file_input = file_inputs.nth(i)
+                        await file_input.set_input_files(str(path))
+                        await page.wait_for_timeout(1000)
+
+                        handle = await file_input.element_handle()
+
+                        if handle:
+                            await page.evaluate(
+                                """
+                                (el) => {
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                                }
+                                """,
+                                handle,
+                            )
+
+                        clicked_menu = True
+                        log.info("Файл передан через input[type=file] #%s после меню", i)
+                        break
+
+                    except Exception as exc:
+                        log.warning("input[type=file] #%s после меню не сработал: %s", i, exc)
+
+            except Exception as exc:
+                log.warning("Ошибка fallback input после меню: %s", exc)
+
+        if not clicked_menu:
+            log.error("Не удалось передать документ в Max")
+            await _save_debug(page, "doc_menu_file_not_passed")
+            return False
+
+        await page.wait_for_timeout(5000)
+
+        ok = await _wait_doc_attached(page, expected_name=doc_name, timeout_ms=30000)
+
+        if ok:
+            log.info("Документ прикреплён успешно: %s", doc_name)
+            return True
+
+        log.error("Документ не прикрепился: подтверждения после меню не появилось")
+        await _save_debug(page, "doc_attach_menu_failed")
+        return False
+
+    except Exception as exc:
+        log.exception("Ошибка прикрепления документа через меню: %s", exc)
+        await _save_debug(page, "doc_attach_menu_exception")
+        return False
+
+
 async def _composer_has_text(page) -> bool:
     try:
         return await page.evaluate(
@@ -435,7 +583,12 @@ async def _click_send(page) -> bool:
         return False
 
 
-async def send_to_max(text: str = "", photo_path: Optional[str] = None) -> bool:
+async def send_to_max(
+    text: str = "",
+    photo_path: Optional[str] = None,
+    document_path: Optional[str] = None,
+    document_name: Optional[str] = None,
+) -> bool:
     text = text or ""
 
     async with async_playwright() as p:
@@ -476,6 +629,7 @@ async def send_to_max(text: str = "", photo_path: Optional[str] = None) -> bool:
             await _composer_textbox(page)
 
             photo_attached = False
+            doc_attached = False
 
             if photo_path and os.path.exists(photo_path):
                 photo_attached = await _attach_photo(page, photo_path)
@@ -483,15 +637,23 @@ async def send_to_max(text: str = "", photo_path: Optional[str] = None) -> bool:
                 if not photo_attached:
                     log.error("Фото не прикрепилось. Если есть текст — отправим только текст.")
 
+            if document_path and os.path.exists(document_path):
+                doc_attached = await _attach_document(
+                    page, document_path, document_name or Path(document_path).name
+                )
+
+                if not doc_attached:
+                    log.error("Документ не прикрепился. Если есть текст — отправим только текст.")
+
             if text.strip():
                 text_ok = await _type_text(page, text)
 
-                if not text_ok and not photo_attached:
-                    log.error("Текст не введён, фото нет — отправлять нечего")
+                if not text_ok and not photo_attached and not doc_attached:
+                    log.error("Текст не введён, вложений нет — отправлять нечего")
                     return False
 
-            if not text.strip() and not photo_attached:
-                log.error("Нет текста и нет фото")
+            if not text.strip() and not photo_attached and not doc_attached:
+                log.error("Нет текста, фото и документа")
                 return False
 
             send_ok = await _click_send(page)

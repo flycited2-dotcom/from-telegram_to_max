@@ -2,9 +2,10 @@
 
 Мост, который пересылает посты из Telegram-канала в чат VK MAX.
 
-Текст и фото из `channel_post`/`message` забираются через Telegram Bot API,
+Текст, фото и документы из `channel_post`/`message` забираются через Telegram Bot API,
 кладутся в asyncio-очередь и по одному отправляются в MAX через Playwright
-(headless Chromium, переиспользование `storage_state`).
+(headless Chromium, переиспользование `storage_state`). Документы — до 20 МБ
+(лимит Telegram Bot API на скачивание через `getFile`).
 
 ## Файлы
 
