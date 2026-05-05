@@ -1,7 +1,5 @@
 import asyncio
-import base64
 import logging
-import mimetypes
 import os
 from pathlib import Path
 from typing import Optional
@@ -350,119 +348,6 @@ async def _attach_photo(page, photo_path: str) -> bool:
         return False
 
 
-async def _wait_doc_attached(page, expected_name: str, timeout_ms: int = 30000) -> bool:
-    """Файл считаем прикреплённым, если внутри composer появилась его имя
-    (карточка с filename) или хотя бы любой attach-элемент."""
-    log.info("Ждём появления документа '%s' в composer", expected_name)
-
-    needle = expected_name.strip()
-    attempts = max(1, timeout_ms // 500)
-
-    for _ in range(attempts):
-        if needle:
-            found_by_name = await page.evaluate(
-                """
-                (name) => {
-                    const composer = document.querySelector('[data-testid="composer"]');
-                    if (!composer) return false;
-                    const text = composer.innerText || composer.textContent || '';
-                    return text.includes(name);
-                }
-                """,
-                needle,
-            )
-
-            if found_by_name:
-                log.info("Документ найден в composer по имени файла")
-                return True
-
-        if await _composer_has_media(page):
-            log.info("Документ найден в composer по media-count")
-            return True
-
-        await page.wait_for_timeout(500)
-
-    log.error("Документ не появился в composer")
-    return False
-
-
-async def _drop_file_into_composer(page, doc_path: str, doc_name: str) -> bool:
-    """Пытаемся прикрепить файл через программный drag-and-drop в основной
-    composer. Если MAX поддерживает drop файлов как media — превью с именем
-    появится внутри composer (как при фото), и тогда мы сможем добавить
-    подпись и отправить одним сообщением через обычный _click_send.
-    Если поддержки нет — возвращаем False, fallback на пункт меню «Файл»."""
-    path = Path(doc_path)
-
-    if not path.exists() or path.stat().st_size <= 0:
-        log.error("Файл для drop не найден/пуст: %s", doc_path)
-        return False
-
-    try:
-        await _wait_composer(page)
-
-        with open(doc_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-
-        mime, _ = mimetypes.guess_type(doc_name)
-        mime = mime or "application/octet-stream"
-
-        log.info("Пробуем drag-and-drop файла '%s' (%s) в composer", doc_name, mime)
-
-        before_count = await _composer_media_count(page)
-
-        await page.evaluate(
-            """
-            ({b64, name, mime}) => {
-                const composer = document.querySelector('[data-testid="composer"]');
-                if (!composer) throw new Error('composer не найден');
-
-                const bin = atob(b64);
-                const bytes = new Uint8Array(bin.length);
-                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-
-                const file = new File([bytes], name, { type: mime });
-                const dt = new DataTransfer();
-                dt.items.add(file);
-
-                const r = composer.getBoundingClientRect();
-                const opts = {
-                    bubbles: true,
-                    cancelable: true,
-                    composed: true,
-                    dataTransfer: dt,
-                    clientX: r.left + r.width / 2,
-                    clientY: r.top + r.height / 2,
-                };
-
-                composer.dispatchEvent(new DragEvent('dragenter', opts));
-                composer.dispatchEvent(new DragEvent('dragover', opts));
-                composer.dispatchEvent(new DragEvent('drop', opts));
-            }
-            """,
-            {"b64": b64, "name": doc_name, "mime": mime},
-        )
-
-        ok = await _wait_doc_attached(page, expected_name=doc_name, timeout_ms=10000)
-
-        if ok:
-            log.info("Файл попал в composer через drag-and-drop")
-            return True
-
-        # Drop не дал media в composer.
-        new_count = await _composer_media_count(page)
-        log.warning(
-            "Drag-and-drop не дал media в composer (было %s, стало %s)",
-            before_count,
-            new_count,
-        )
-        return False
-
-    except Exception as exc:
-        log.warning("Drag-and-drop файла не удался: %s", exc)
-        return False
-
-
 async def _send_document_via_menu(page, doc_path: str, doc_name: str) -> bool:
     """MAX-style: клик скрепка → пункт «Файл» → передать файл.
     После set_files MAX отправляет файл немедленно как отдельное сообщение
@@ -706,7 +591,6 @@ async def send_to_max(
             await _composer_textbox(page)
 
             photo_attached = False
-            doc_in_composer = False
 
             if photo_path and os.path.exists(photo_path):
                 photo_attached = await _attach_photo(page, photo_path)
@@ -715,76 +599,61 @@ async def send_to_max(
                     log.error("Фото не прикрепилось. Если есть текст — отправим только текст.")
 
             doc_present = bool(document_path and os.path.exists(document_path))
-            effective_doc_name = (document_name or (Path(document_path).name if document_path else ""))
 
-            # Документ: сначала пробуем drag-and-drop (даёт превью в composer
-            # и позволяет добавить подпись одним сообщением), при неудаче —
-            # split-flow ниже (текст → Send, потом файл через меню отдельно).
+            # Документ: UI MAX не даёт подписи к файлу — пункт «Файл» отправляет
+            # файл сразу через file_chooser. Поэтому документ всегда летит
+            # отдельным сообщением. Для естественного порядка сначала шлём
+            # текст (caption Telegram-поста окажется выше файла), потом файл.
             if doc_present:
-                doc_in_composer = await _drop_file_into_composer(
-                    page, document_path, effective_doc_name
-                )
-
-                if doc_in_composer:
-                    log.info("Документ в composer (drag-and-drop) — отправим одним сообщением")
-                else:
-                    log.warning(
-                        "Drag-and-drop не дал превью. Используем split: текст -> Send, файл -> меню"
-                    )
-
-            # Главный composer-send: фото / drop-документ / только текст
-            if photo_attached or doc_in_composer or not doc_present:
                 if text.strip():
                     text_ok = await _type_text(page, text)
+                    if text_ok:
+                        text_send_ok = await _click_send(page)
+                        if text_send_ok:
+                            log.info("Текст отправлен (1/2)")
+                        else:
+                            log.warning("Текст не отправился, всё равно пробуем отправить файл")
+                        await page.wait_for_timeout(2500)
+                    else:
+                        log.warning("Текст не введён, идём дальше с файлом")
 
-                    if not text_ok and not photo_attached and not doc_in_composer:
-                        log.error("Текст не введён, вложений нет — отправлять нечего")
-                        return False
-
-                if not text.strip() and not photo_attached and not doc_in_composer:
-                    log.error("Нет текста, фото и документа")
-                    return False
-
-                send_ok = await _click_send(page)
+                doc_send_ok = await _send_document_via_menu(
+                    page,
+                    document_path,
+                    document_name or Path(document_path).name,
+                )
 
                 await context.storage_state(path=SESSION_FILE)
 
-                if send_ok:
-                    log.info("Сообщение отправлено в Max")
-                else:
-                    log.error("Сообщение не отправлено")
+                if doc_send_ok:
+                    log.info("Файл отправлен (2/2)")
+                    return True
 
-                return send_ok
+                log.error("Файл не отправлен")
+                return False
 
-            # Split-flow для документа без drag-and-drop.
-            # Сначала отправляем текст (если есть) — он окажется ВЫШЕ файла,
-            # т.е. в порядке «описание → файл».
-            text_send_ok = True
+            # Без документа: обычный flow (фото и/или текст одним сообщением).
             if text.strip():
                 text_ok = await _type_text(page, text)
-                if text_ok:
-                    text_send_ok = await _click_send(page)
-                    if text_send_ok:
-                        log.info("Текст отправлен (1/2)")
-                    else:
-                        log.warning("Текст не отправился, всё равно пробуем отправить файл")
-                    # Дадим UI прийти в себя перед прикреплением файла
-                    await page.wait_for_timeout(2500)
-                else:
-                    log.warning("Текст не введён, идём дальше с файлом")
 
-            doc_send_ok = await _send_document_via_menu(
-                page, document_path, effective_doc_name
-            )
+                if not text_ok and not photo_attached:
+                    log.error("Текст не введён, вложений нет — отправлять нечего")
+                    return False
+
+            if not text.strip() and not photo_attached:
+                log.error("Нет текста и нет фото")
+                return False
+
+            send_ok = await _click_send(page)
 
             await context.storage_state(path=SESSION_FILE)
 
-            if doc_send_ok:
-                log.info("Файл отправлен (2/2)")
+            if send_ok:
+                log.info("Сообщение отправлено в Max")
             else:
-                log.error("Файл не отправлен")
+                log.error("Сообщение не отправлено")
 
-            return doc_send_ok and (text_send_ok or not text.strip())
+            return send_ok
 
         except Exception as exc:
             log.exception("Ошибка send_to_max: %s", exc)
