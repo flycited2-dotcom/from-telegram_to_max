@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram -> MAX bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tg-max-bridge
+EnvironmentFile=/opt/tg-max-bridge/.env
+ExecStart=/opt/tg-max-bridge/.venv/bin/python /opt/tg-max-bridge/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

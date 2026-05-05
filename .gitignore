@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+*.log
+max_session.json
+debug/
+*.bak
+*.backup-*
+*.before-*
+*.WORKING-*
+.venv/
+venv/
