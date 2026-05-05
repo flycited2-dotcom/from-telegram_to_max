@@ -68,12 +68,15 @@ async def _type_text(page, text: str) -> bool:
 
         # Enter в композере MAX = отправить, поэтому многострочный текст
         # вводим строками с Shift+Enter (soft break) между ними.
+        # insert_text вместо type: один composition-input event на всю строку,
+        # без keystroke-эмуляции — иначе Lexical роняет составные эмодзи
+        # (🔥, 🅰️ с variation selector и т.п.) и текст в композер не попадает.
         lines = text.split("\n")
         for i, line in enumerate(lines):
             if i > 0:
                 await page.keyboard.press("Shift+Enter")
             if line:
-                await page.keyboard.type(line, delay=10)
+                await page.keyboard.insert_text(line)
         await page.wait_for_timeout(800)
 
         first_line = next((ln for ln in lines if ln.strip()), "")[:80]
@@ -109,6 +112,7 @@ async def _type_text(page, text: str) -> bool:
             log.warning(
                 "Точное совпадение не нашли, но в composer есть текст — продолжаем"
             )
+            await _save_debug(page, "text_soft_fallback")
             return True
 
         log.error("Текст не введён в composer")
