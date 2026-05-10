@@ -3,16 +3,27 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from max_sender import send_to_max
 
@@ -42,12 +53,6 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
-send_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
-
-# Заполняется в post_init из app.bot, чтобы _notify_admin_failure мог писать
-# в личку администратора через тот же Bot-инстанс, что обслуживает polling.
-_admin_bot = None
-
 
 @dataclass
 class BridgeJob:
@@ -61,9 +66,84 @@ class BridgeJob:
     created_at: float
 
 
+class JobQueue:
+    """deque + asyncio.Event. Поверх FIFO даёт pop_last/pop_n/clear, чтобы
+    /cancel_last /cancel_5 /cancel_all могли удалять задачи из хвоста очереди."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._items: deque[BridgeJob] = deque()
+        self._maxsize = maxsize
+        self._event = asyncio.Event()
+
+    def put_nowait(self, job: BridgeJob) -> None:
+        if len(self._items) >= self._maxsize:
+            raise asyncio.QueueFull
+        self._items.append(job)
+        self._event.set()
+
+    async def get(self) -> BridgeJob:
+        while not self._items:
+            self._event.clear()
+            await self._event.wait()
+        job = self._items.popleft()
+        if not self._items:
+            self._event.clear()
+        return job
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def snapshot(self) -> List[BridgeJob]:
+        return list(self._items)
+
+    def pop_last(self) -> Optional[BridgeJob]:
+        if not self._items:
+            return None
+        return self._items.pop()
+
+    def pop_n_last(self, n: int) -> List[BridgeJob]:
+        removed: List[BridgeJob] = []
+        for _ in range(min(n, len(self._items))):
+            removed.append(self._items.pop())
+        return removed
+
+    def clear_all(self) -> List[BridgeJob]:
+        removed = list(self._items)
+        self._items.clear()
+        self._event.clear()
+        return removed
+
+
+send_queue = JobQueue(maxsize=QUEUE_MAX_SIZE)
+
+# Последние N завершённых задач — для /status. Сбрасывается при рестарте.
+recent_jobs: deque = deque(maxlen=50)
+
+# Заполняется в post_init из app.bot, чтобы _notify_admin_failure мог писать
+# в личку администратора через тот же Bot-инстанс, что обслуживает polling.
+_admin_bot = None
+
+
 def _safe_filename(raw: Optional[str], fallback: str) -> str:
     cleaned = re.sub(r"[\\/\x00]", "_", raw or "").strip()
     return cleaned or fallback
+
+
+def _cleanup_job_files(job: BridgeJob) -> None:
+    """Снести временные файлы задачи. Зовём из worker'а после отправки
+    и из /cancel_* после удаления из очереди."""
+    if job.photo_path and os.path.exists(job.photo_path):
+        try:
+            os.remove(job.photo_path)
+        except Exception as exc:
+            log.warning("[%s] Не удалось удалить временное фото: %s", job.job_id, exc)
+
+    if job.document_path:
+        doc_dir = os.path.dirname(job.document_path)
+        try:
+            shutil.rmtree(doc_dir, ignore_errors=True)
+        except Exception as exc:
+            log.warning("[%s] Не удалось удалить временный документ: %s", job.job_id, exc)
 
 
 async def _fetch_with_retry(
@@ -208,14 +288,7 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("[%s] Задача добавлена в очередь. Размер очереди: %s", job_id, send_queue.qsize())
     except asyncio.QueueFull:
         log.error("[%s] Очередь переполнена, задача потеряна", job_id)
-
-        if photo_path and os.path.exists(photo_path):
-            try:
-                os.remove(photo_path)
-            except Exception:
-                pass
-        if document_path:
-            shutil.rmtree(os.path.dirname(document_path), ignore_errors=True)
+        _cleanup_job_files(job)
 
 
 async def _notify_admin_failure(job: "BridgeJob") -> None:
@@ -294,6 +367,7 @@ async def max_worker():
             bool(job.document_path)
         )
 
+        ok = False
         try:
             ok = await _send_job_with_retry(job)
 
@@ -304,23 +378,168 @@ async def max_worker():
                 await _notify_admin_failure(job)
 
         finally:
-            if job.photo_path and os.path.exists(job.photo_path):
-                try:
-                    os.remove(job.photo_path)
-                    log.info("[%s] Временное фото удалено: %s", job.job_id, job.photo_path)
-                except Exception as exc:
-                    log.warning("[%s] Не удалось удалить временное фото: %s", job.job_id, exc)
-
-            if job.document_path:
-                doc_dir = os.path.dirname(job.document_path)
-                try:
-                    shutil.rmtree(doc_dir, ignore_errors=True)
-                    log.info("[%s] Временный документ удалён: %s", job.job_id, job.document_path)
-                except Exception as exc:
-                    log.warning("[%s] Не удалось удалить временный документ: %s", job.job_id, exc)
-
-            send_queue.task_done()
+            _cleanup_job_files(job)
+            recent_jobs.append({
+                "job_id": job.job_id,
+                "chat_id": job.chat_id,
+                "message_id": job.message_id,
+                "status": "done" if ok else "failed",
+                "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "has_photo": bool(job.photo_path),
+                "has_document": bool(job.document_path),
+            })
             log.info("[%s] Задача завершена. Очередь: %s", job.job_id, send_queue.qsize())
+
+
+def _is_admin(update: Update) -> bool:
+    if ADMIN_CHAT_ID is None:
+        return False
+    user = update.effective_user
+    return user is not None and user.id == ADMIN_CHAT_ID
+
+
+def _menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статус", callback_data="status")],
+        [InlineKeyboardButton("⏪ Отменить последнюю", callback_data="cancel_last")],
+        [InlineKeyboardButton("5️⃣ Отменить 5 последних", callback_data="cancel_5")],
+        [InlineKeyboardButton("🗑 Очистить очередь", callback_data="cancel_all")],
+        [InlineKeyboardButton("🔄 Рестарт сервиса", callback_data="restart")],
+    ])
+
+
+def _format_status() -> str:
+    pending = send_queue.snapshot()
+    done = sum(1 for j in recent_jobs if j["status"] == "done")
+    failed = sum(1 for j in recent_jobs if j["status"] == "failed")
+
+    lines = [
+        "📊 *Статус моста*",
+        f"В очереди: {len(pending)}",
+        f"За последние {len(recent_jobs)} задач: ✅ {done} / ❌ {failed}",
+    ]
+
+    if pending:
+        lines.append("")
+        lines.append("Ожидают:")
+        for j in pending[:10]:
+            wait = round(time.time() - j.created_at)
+            kind = []
+            if j.text:
+                kind.append("text")
+            if j.photo_path:
+                kind.append("photo")
+            if j.document_path:
+                kind.append("doc")
+            lines.append(f"  • {j.job_id} (msg {j.message_id}, {wait}с, {','.join(kind) or '—'})")
+        if len(pending) > 10:
+            lines.append(f"  … и ещё {len(pending) - 10}")
+
+    if recent_jobs:
+        lines.append("")
+        lines.append("Последние:")
+        for j in list(recent_jobs)[-5:]:
+            mark = "✅" if j["status"] == "done" else "❌"
+            lines.append(f"  {mark} {j['job_id']} (msg {j['message_id']})")
+
+    return "\n".join(lines)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    await update.effective_message.reply_text(
+        "Привет! Я мост Telegram → MAX.\n"
+        "Управление — кнопками ниже или командами /menu, /status.",
+        reply_markup=_menu_keyboard(),
+    )
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    await update.effective_message.reply_text("Меню:", reply_markup=_menu_keyboard())
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    await update.effective_message.reply_text(_format_status(), parse_mode="Markdown")
+
+
+async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None:
+        return
+    if not _is_admin(update):
+        await query.answer("Нет доступа", show_alert=False)
+        return
+
+    action = query.data
+
+    if action == "status":
+        await query.answer()
+        await query.message.reply_text(_format_status(), parse_mode="Markdown")
+        return
+
+    if action == "cancel_last":
+        job = send_queue.pop_last()
+        await query.answer()
+        if job:
+            _cleanup_job_files(job)
+            await query.message.reply_text(
+                f"⏪ Отменена последняя в очереди: {job.job_id} (msg {job.message_id}). "
+                f"Осталось: {send_queue.qsize()}"
+            )
+            log.info("[admin] Отменена последняя: %s", job.job_id)
+        else:
+            await query.message.reply_text("Очередь пуста — нечего отменять.")
+        return
+
+    if action == "cancel_5":
+        removed = send_queue.pop_n_last(5)
+        await query.answer()
+        for j in removed:
+            _cleanup_job_files(j)
+            log.info("[admin] Отменена: %s", j.job_id)
+        await query.message.reply_text(
+            f"5️⃣ Удалено из очереди: {len(removed)}. Осталось: {send_queue.qsize()}"
+        )
+        return
+
+    if action == "cancel_all":
+        removed = send_queue.clear_all()
+        await query.answer()
+        for j in removed:
+            _cleanup_job_files(j)
+        log.info("[admin] Очередь очищена, удалено %s задач", len(removed))
+        await query.message.reply_text(
+            f"🗑 Очередь очищена ({len(removed)} задач удалено). "
+            "Текущая (если есть) добивает доставку."
+        )
+        return
+
+    if action == "restart":
+        await query.answer()
+        await query.message.reply_text("🔄 Перезапускаю сервис, вернусь через ~10 сек.")
+        log.info("[admin] Запрошен рестарт сервиса")
+        # systemd сам поднимет сервис после `Restart=always`. Используем
+        # Popen, чтобы не блокироваться на ожидании systemctl.
+        try:
+            subprocess.Popen(
+                ["systemctl", "restart", "tg-max-bridge.service"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            log.exception("Ошибка systemctl restart: %s", exc)
+            await query.message.reply_text(f"Не удалось рестартовать: {exc}")
+            return
+        # Дадим сообщению уйти, потом завершимся.
+        await asyncio.sleep(1)
+        sys.exit(0)
+
+    await query.answer("Неизвестное действие")
 
 
 async def post_init(app: Application):
@@ -341,6 +560,10 @@ def main():
         .build()
     )
 
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CallbackQueryHandler(cb_handler))
     app.add_handler(MessageHandler(filters.ALL, handle_post))
 
     app.run_polling(
