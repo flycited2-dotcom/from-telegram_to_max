@@ -61,6 +61,35 @@ def _safe_filename(raw: Optional[str], fallback: str) -> str:
     return cleaned or fallback
 
 
+async def _fetch_with_retry(
+    bot,
+    file_id: str,
+    target_path: str,
+    job_id: str,
+    kind: str,
+    max_attempts: int = 3,
+    delay: float = 3.0,
+) -> bool:
+    """Скачать file_id в target_path с N повторными попытками. Telegram API
+    периодически отдаёт `Timed out` на больших фото/документах — без retry
+    мы это проглатывали и теряли вложение."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            file = await bot.get_file(file_id)
+            await file.download_to_drive(target_path)
+            if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                return True
+            log.warning("[%s] %s: попытка %s — файла нет/пустой", job_id, kind, attempt)
+        except Exception as exc:
+            log.warning("[%s] %s: попытка %s упала: %s", job_id, kind, attempt, exc)
+
+        if attempt < max_attempts:
+            await asyncio.sleep(delay)
+
+    log.error("[%s] %s: все %s попыток скачивания провалились", job_id, kind, max_attempts)
+    return False
+
+
 def describe_update(update: Update) -> str:
     msg = update.channel_post or update.message or update.edited_channel_post or update.edited_message
 
@@ -113,20 +142,17 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if msg.photo:
-        try:
-            photo = msg.photo[-1]
-            file = await context.bot.get_file(photo.file_id)
-            photo_path = f"/tmp/tg_photo_{job_id}_{photo.file_id}.jpg"
-            await file.download_to_drive(photo_path)
-
-            if os.path.exists(photo_path):
-                log.info("[%s] Фото скачано: %s, размер=%s байт", job_id, photo_path, os.path.getsize(photo_path))
-            else:
-                log.error("[%s] После скачивания фото файла нет: %s", job_id, photo_path)
-                photo_path = None
-
-        except Exception as exc:
-            log.exception("[%s] Ошибка скачивания фото: %s", job_id, exc)
+        photo = msg.photo[-1]
+        photo_path = f"/tmp/tg_photo_{job_id}_{photo.file_id}.jpg"
+        ok = await _fetch_with_retry(context.bot, photo.file_id, photo_path, job_id, "Фото")
+        if ok:
+            log.info(
+                "[%s] Фото скачано: %s, размер=%s байт",
+                job_id,
+                photo_path,
+                os.path.getsize(photo_path),
+            )
+        else:
             photo_path = None
 
     if msg.document:
@@ -139,30 +165,21 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 doc.file_size,
             )
         else:
-            try:
-                doc_dir = tempfile.mkdtemp(prefix=f"tg_doc_{job_id}_")
-                document_name = _safe_filename(doc.file_name, f"file_{doc.file_id}")
-                document_path = os.path.join(doc_dir, document_name)
-                file = await context.bot.get_file(doc.file_id)
-                await file.download_to_drive(document_path)
-
-                if os.path.exists(document_path):
-                    log.info(
-                        "[%s] Документ скачан: %s, размер=%s байт",
-                        job_id,
-                        document_path,
-                        os.path.getsize(document_path),
-                    )
-                else:
-                    log.error("[%s] После скачивания документа файла нет: %s", job_id, document_path)
-                    shutil.rmtree(doc_dir, ignore_errors=True)
-                    document_path = None
-                    document_name = None
-
-            except Exception as exc:
-                log.exception("[%s] Ошибка скачивания документа: %s", job_id, exc)
-                if document_path:
-                    shutil.rmtree(os.path.dirname(document_path), ignore_errors=True)
+            doc_dir = tempfile.mkdtemp(prefix=f"tg_doc_{job_id}_")
+            document_name = _safe_filename(doc.file_name, f"file_{doc.file_id}")
+            document_path = os.path.join(doc_dir, document_name)
+            ok = await _fetch_with_retry(
+                context.bot, doc.file_id, document_path, job_id, "Документ"
+            )
+            if ok:
+                log.info(
+                    "[%s] Документ скачан: %s, размер=%s байт",
+                    job_id,
+                    document_path,
+                    os.path.getsize(document_path),
+                )
+            else:
+                shutil.rmtree(doc_dir, ignore_errors=True)
                 document_path = None
                 document_name = None
 
@@ -196,6 +213,36 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(os.path.dirname(document_path), ignore_errors=True)
 
 
+async def _send_job_with_retry(job: "BridgeJob", max_attempts: int = 2, retry_delay: float = 10.0) -> bool:
+    """Зовёт send_to_max до max_attempts раз. На транзиентных сбоях
+    (Playwright timeout, отвалившаяся сессия) вторая попытка через
+    retry_delay сек обычно проходит — open browser в send_to_max
+    создаётся заново для каждой попытки."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ok = await asyncio.wait_for(
+                send_to_max(
+                    text=job.text,
+                    photo_path=job.photo_path,
+                    document_path=job.document_path,
+                    document_name=job.document_name,
+                ),
+                timeout=MAX_SEND_TIMEOUT,
+            )
+            if ok:
+                return True
+            log.warning("[%s] Попытка отправки %s вернула False", job.job_id, attempt)
+        except asyncio.TimeoutError:
+            log.warning("[%s] Попытка %s: таймаут %s сек", job.job_id, attempt, MAX_SEND_TIMEOUT)
+        except Exception as exc:
+            log.exception("[%s] Попытка %s: ошибка отправки: %s", job.job_id, attempt, exc)
+
+        if attempt < max_attempts:
+            await asyncio.sleep(retry_delay)
+
+    return False
+
+
 async def max_worker():
     log.info("Max worker запущен")
 
@@ -214,26 +261,12 @@ async def max_worker():
         )
 
         try:
-            ok = await asyncio.wait_for(
-                send_to_max(
-                    text=job.text,
-                    photo_path=job.photo_path,
-                    document_path=job.document_path,
-                    document_name=job.document_name,
-                ),
-                timeout=MAX_SEND_TIMEOUT
-            )
+            ok = await _send_job_with_retry(job)
 
             if ok:
                 log.info("[%s] Успешно отправлено в Max", job.job_id)
             else:
-                log.error("[%s] send_to_max вернул False", job.job_id)
-
-        except asyncio.TimeoutError:
-            log.error("[%s] Таймаут отправки в Max: %s сек", job.job_id, MAX_SEND_TIMEOUT)
-
-        except Exception as exc:
-            log.exception("[%s] Ошибка отправки в Max: %s", job.job_id, exc)
+                log.error("[%s] Все попытки отправки провалились", job.job_id)
 
         finally:
             if job.photo_path and os.path.exists(job.photo_path):
