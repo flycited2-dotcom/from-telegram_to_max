@@ -23,6 +23,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_IDS = frozenset(
     int(x) for x in os.environ["CHANNEL_IDS"].split(",") if x.strip()
 )
+ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"]) if os.environ.get("ADMIN_CHAT_ID") else None
 LOG_FILE = str(Path(__file__).parent / "bridge.log")
 
 MAX_SEND_TIMEOUT = 240
@@ -42,6 +43,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 send_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+
+# Заполняется в post_init из app.bot, чтобы _notify_admin_failure мог писать
+# в личку администратора через тот же Bot-инстанс, что обслуживает polling.
+_admin_bot = None
 
 
 @dataclass
@@ -213,6 +218,35 @@ async def handle_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(os.path.dirname(document_path), ignore_errors=True)
 
 
+async def _notify_admin_failure(job: "BridgeJob") -> None:
+    """Сообщить администратору в личку, что пост не доставлен. Тихо
+    проглатываем 403 / прочие ошибки send_message — администратор мог
+    ещё не нажать /start у бота, в этом случае Telegram не позволит
+    инициировать диалог."""
+    if not ADMIN_CHAT_ID or _admin_bot is None:
+        return
+
+    preview = (job.text or "(без текста)")[:200]
+    if job.text and len(job.text) > 200:
+        preview += "…"
+
+    text = (
+        "⚠️ Пост не доставлен в Max\n"
+        f"Канал: {job.chat_id}\n"
+        f"message_id: {job.message_id}\n"
+        f"Вложения: photo={bool(job.photo_path)}, document={bool(job.document_path)}"
+    )
+    if job.document_name:
+        text += f" ({job.document_name})"
+    text += f"\nТекст: {preview}"
+
+    try:
+        await _admin_bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+        log.info("[%s] Уведомление администратору отправлено", job.job_id)
+    except Exception as exc:
+        log.warning("[%s] Не удалось отправить уведомление администратору: %s", job.job_id, exc)
+
+
 async def _send_job_with_retry(job: "BridgeJob", max_attempts: int = 2, retry_delay: float = 10.0) -> bool:
     """Зовёт send_to_max до max_attempts раз. На транзиентных сбоях
     (Playwright timeout, отвалившаяся сессия) вторая попытка через
@@ -267,6 +301,7 @@ async def max_worker():
                 log.info("[%s] Успешно отправлено в Max", job.job_id)
             else:
                 log.error("[%s] Все попытки отправки провалились", job.job_id)
+                await _notify_admin_failure(job)
 
         finally:
             if job.photo_path and os.path.exists(job.photo_path):
@@ -289,6 +324,8 @@ async def max_worker():
 
 
 async def post_init(app: Application):
+    global _admin_bot
+    _admin_bot = app.bot
     app.create_task(max_worker())
 
 
