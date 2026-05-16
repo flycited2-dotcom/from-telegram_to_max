@@ -30,7 +30,7 @@ async def _save_debug(page, name: str):
 
 async def _wait_composer(page):
     composer = page.locator('[data-testid="composer"]').first
-    await composer.wait_for(state="visible", timeout=30000)
+    await composer.wait_for(state="visible", timeout=90000)
     log.info("Composer найден")
     return composer
 
@@ -43,7 +43,7 @@ async def _composer_textbox(page):
     if await textbox.count() <= 0:
         textbox = composer.locator('div[role="textbox"]').first
 
-    await textbox.wait_for(state="visible", timeout=15000)
+    await textbox.wait_for(state="visible", timeout=60000)
 
     box = await textbox.bounding_box()
     log.info("Поле сообщения найдено внутри composer: %s", box)
@@ -249,7 +249,7 @@ async def _attach_photo(page, photo_path: str) -> bool:
         log.info("Прикрепляем фото через меню Max: скрепка -> Фото или видео")
 
         upload_button = composer.locator('button[aria-label="Загрузить файл"]').first
-        await upload_button.wait_for(state="visible", timeout=15000)
+        await upload_button.wait_for(state="visible", timeout=45000)
 
         # 1. Открываем меню скрепки
         await upload_button.click(force=True)
@@ -369,7 +369,7 @@ async def _send_document_via_menu(page, doc_path: str, doc_name: str) -> bool:
         log.info("Прикрепляем документ через меню Max: скрепка -> Файл")
 
         upload_button = composer.locator('button[aria-label="Загрузить файл"]').first
-        await upload_button.wait_for(state="visible", timeout=15000)
+        await upload_button.wait_for(state="visible", timeout=45000)
 
         await upload_button.click(force=True)
         await page.wait_for_timeout(1000)

@@ -37,7 +37,7 @@ CHANNEL_IDS = frozenset(
 ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"]) if os.environ.get("ADMIN_CHAT_ID") else None
 LOG_FILE = str(Path(__file__).parent / "bridge.log")
 
-MAX_SEND_TIMEOUT = 240
+MAX_SEND_TIMEOUT = 900
 QUEUE_MAX_SIZE = 100
 # Telegram Bot API лимит на скачивание файлов через get_file — 20 МБ.
 DOC_MAX_SIZE = 20 * 1024 * 1024
