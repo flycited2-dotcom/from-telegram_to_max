@@ -25,6 +25,7 @@ from telegram.ext import (
     filters,
 )
 
+from logging_config import configure_logging
 from max_sender import send_to_max
 
 
@@ -42,14 +43,7 @@ QUEUE_MAX_SIZE = 100
 # Telegram Bot API лимит на скачивание файлов через get_file — 20 МБ.
 DOC_MAX_SIZE = 20 * 1024 * 1024
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
+configure_logging(LOG_FILE)
 
 log = logging.getLogger(__name__)
 
